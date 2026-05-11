@@ -1,4 +1,4 @@
-# Budget V7
+# Budget Udregner 
 <html lang="da">
 <head>
 <meta charset="UTF-8"/>
@@ -760,20 +760,24 @@ function buildTable(cat){
   h+=`<tbody id="tbody-${cat.id}">`;
   cat.rows.forEach(row=>{h+=buildRowHTML(cat,row);});
 
-  // Subtotal
-  const colspan=3;
-  h+=`<tr class="subtotal-row"><td></td><td colspan="${colspan}" style="font-weight:700;font-family:'DM Sans',sans-serif">${T[lang].subtotal} — ${catLabel(cat)}</td>`;
-  if(cat.hasFte) yr.forEach(()=>{h+=`<td></td>`;});
-  yr.forEach(y=>{h+=`<td class="mc" id="sc_${cat.id}_${y}"></td>`;});
-  h+=`<td class="mc" id="sc_${cat.id}_tot"></td></tr>`;
+  // Subtotal — colspan covers: drag(1) + sub(1) + desc(1) + inst(1) = 4
+  h+=`<tr class="subtotal-row">
+    <td colspan="4" style="font-weight:700;font-family:'DM Sans',sans-serif;padding-left:10px">${T[lang].subtotal} — ${catLabel(cat)}</td>`;
+  yr.forEach(y=>{
+    if(cat.hasFte) h+=`<td class="mc"></td>`; // empty FTE cell
+    h+=`<td class="mc" id="sc_${cat.id}_${y}" style="text-align:right;padding-right:7px"></td>`;
+  });
+  h+=`<td class="mc" id="sc_${cat.id}_tot" style="text-align:right;padding-right:7px"></td></tr>`;
 
-  // Overhead
+  // Overhead row — same structure
   h+=`<tr class="overhead-row" id="oh_${cat.id}" style="${overheadPct>0?'':'display:none'}">
-    <td></td><td colspan="${colspan}">${T[lang].overheadRow}${overheadPct>0?` (${overheadPct}%)`:''}`;
+    <td colspan="4" style="padding-left:10px">${T[lang].overheadRow}${overheadPct>0?` (${overheadPct}%)`:''}`;
   h+=`</td>`;
-  if(cat.hasFte) yr.forEach(()=>{h+=`<td></td>`;});
-  yr.forEach(y=>{h+=`<td class="mc" id="oc_${cat.id}_${y}"></td>`;});
-  h+=`<td class="mc" id="oc_${cat.id}_tot"></td></tr>`;
+  yr.forEach(y=>{
+    if(cat.hasFte) h+=`<td class="mc"></td>`;
+    h+=`<td class="mc" id="oc_${cat.id}_${y}" style="text-align:right;padding-right:7px"></td>`;
+  });
+  h+=`<td class="mc" id="oc_${cat.id}_tot" style="text-align:right;padding-right:7px"></td></tr>`;
 
   h+=`</tbody></table>`;
   wrap.innerHTML=h;
@@ -1027,41 +1031,82 @@ window.exportPDF=function(){
   const doc=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
   const yr=yrs();
   const projTitle=document.getElementById('proj-title').value||'';
-  const gt=grandTotal();
-  const oh=overheadPct>0?Math.round(gt*overheadPct/100):0;
   const isDa=lang==='da';
   const dateStr=new Date().toLocaleDateString(isDa?'da-DK':'en-GB');
+  const isEUR=currency==='EUR';
+  const curSym=isEUR?'€':'kr.';
+
+  // ── Currency formatter for PDF (respects UI currency selection) ──
+  function pdfFmt(dkk){
+    const v=isEUR?Math.round(dkk/eurRate):Math.round(dkk);
+    const s=Math.abs(v).toLocaleString('da-DK');
+    return isEUR?`€\u00a0${s}`:`${s}\u00a0kr.`;
+  }
+
+  const gt=grandTotal(); // always in DKK
+  const oh=overheadPct>0?Math.round(gt*overheadPct/100):0;
 
   const RED=[192,57,43],BLUE_H=[26,86,176],BLUE_TOT=[214,228,247];
   const DARK=[28,27,24],GREY2=[107,104,96],BLUE_LP=[235,245,255];
-  const PAGE_W=297,MARGIN=8,TBL_W=PAGE_W-2*MARGIN; // 281mm
+  const PAGE_W=297,MARGIN=8,TBL_W=PAGE_W-2*MARGIN; // 281mm exactly
 
-  // Header
+  // ── Page header ──
   doc.setFillColor(...RED);doc.rect(0,0,PAGE_W,20,'F');
   doc.setTextColor(255,255,255);
   doc.setFontSize(13);doc.setFont(undefined,'bold');
   doc.text(isDa?'Forskningsbudget':'Research Budget',MARGIN+2,12);
   if(projTitle){doc.setFontSize(9);doc.setFont(undefined,'normal');doc.text(projTitle,MARGIN+2,18);}
-  doc.setFontSize(8);doc.text(dateStr,PAGE_W-MARGIN,12,{align:'right'});
-  if(inflationPct>0){
-    const inflStr=isDa?`Lønstigning: ${inflationPct}% pr. år`:`Salary increase: ${inflationPct}% p.a.`;
-    doc.text(inflStr,PAGE_W-MARGIN,18,{align:'right'});
-  }
+  doc.setFontSize(8);doc.setFont(undefined,'normal');
+  doc.text(dateStr,PAGE_W-MARGIN,12,{align:'right'});
+  const metaLine=[];
+  if(isEUR) metaLine.push(`${curSym} (1 EUR = ${eurRate} DKK)`);
+  if(inflationPct>0) metaLine.push(isDa?`Lønstigning: ${inflationPct}%/år`:`Salary increase: ${inflationPct}%/yr`);
+  if(overheadPct>0) metaLine.push(`Overhead: ${overheadPct}%`);
+  if(metaLine.length>0) doc.text(metaLine.join(' · '),PAGE_W-MARGIN,18,{align:'right'});
 
   let yPos=26;
+
+  // ── Fixed column widths — identical for ALL categories ──
+  // Layout: Sub | Inst | Desc | [FTE_y]? | Bud_y | ... | Total
+  // We always include FTE columns for hasFte cats. For non-FTE cats, no FTE col.
+  // To keep Budget columns same width across cats, we compute BUD_W using hasFte layout
+  // and apply the same BUD_W to non-FTE cats.
+  const SUB=44, INST_C=14, DESC_W=34, TOT=30;
+  const FIXED=SUB+INST_C+DESC_W+TOT; // 122mm
+  const FTE_W_FTE=13; // FTE col width when category hasFte
+  // Compute BUD_W as if we have the max columns (hasFte, 5 years) — then reuse same BUD_W
+  // For the actual category, non-FTE cats get more space per budget col naturally
+  // but we force same BUD_W for visual consistency
+  const maxFteCols=yr.length; // FTE col appears yr.length times for hasFte cats
+  // Budget width: remaining after fixed and FTE cols, divided by year count
+  // For hasFte: TBL_W - FIXED - yr.length*FTE_W_FTE split among yr.length bud cols
+  // For non-FTE: TBL_W - FIXED split among yr.length bud cols
+  // We set BUD_W to the hasFte value so columns are consistent
+  const remForBud_fte = TBL_W - FIXED - yr.length*FTE_W_FTE;
+  const BUD_W = Math.floor(remForBud_fte / yr.length);
+  // For non-FTE cats, distribute extra (FTE_W*yrs) proportionally into budget cols
+  const BUD_W_NOFTE = Math.floor((TBL_W - FIXED) / yr.length);
+  // Rounding remainders
+  function budRemainder(hasFte){
+    const rem=hasFte?(TBL_W-FIXED-yr.length*FTE_W_FTE-yr.length*BUD_W):(TBL_W-FIXED-yr.length*BUD_W_NOFTE);
+    return rem;
+  }
 
   // ── Per category ──
   categories.forEach(cat=>{
     const visRows=cat.rows.filter(row=>{
       if(instFilter!=='all'&&row.inst!==instFilter)return false;
+      // Include row if ANY year has a budget amount OR FTE set
       return yr.some(y=>rowBudget(row,y)>0||(cat.hasFte&&(row.fte[y]||0)>0));
     });
     if(!visRows.length)return;
 
-    const estH=9+visRows.length*7+8;
+    // Estimate height for page break
+    const descLines=cat.desc?Math.ceil(cat.desc.length/80)+1:0;
+    const estH=8+descLines*4+(visRows.length+1)*7+(overheadPct>0?6:0);
     if(yPos+estH>200){doc.addPage();yPos=10;}
 
-    // Category bar
+    // Category colour bar
     doc.setFillColor(...hexToRgb(cat.color));
     doc.rect(MARGIN,yPos,TBL_W,7,'F');
     doc.setTextColor(255,255,255);
@@ -1070,93 +1115,126 @@ window.exportPDF=function(){
     yPos+=7;
     if(cat.desc){
       doc.setTextColor(...GREY2);doc.setFontSize(7.5);doc.setFont(undefined,'italic');
-      const lines=doc.splitTextToSize(cat.desc,TBL_W-4);
-      doc.text(lines,MARGIN+3,yPos+4);yPos+=4+(lines.length-1)*4+2;
+      const lines=doc.splitTextToSize(cat.desc,TBL_W-6);
+      doc.text(lines,MARGIN+3,yPos+4);
+      yPos+=lines.length*4+3;
     }
 
-    // Column widths for this category
-    // Fixed: Sub(46) Inst(16) Desc(38) = 100
-    // Per year: FTE(12)+Bud(22) = 34 if hasFte, else 25
-    // Total(25)
-    const SUB=46,INST_C=16,DESC=38,TOT=25;
-    const fixW=SUB+INST_C+DESC+TOT;
-    const colsPerYr=cat.hasFte?2:1;
-    const yrW=Math.floor((TBL_W-fixW)/(yr.length*colsPerYr));
-    const FTE_W=cat.hasFte?Math.round(yrW*0.40):0;
-    const BUD_W=cat.hasFte?yrW-FTE_W:yrW;
+    const bw=cat.hasFte?BUD_W:BUD_W_NOFTE;
+    const brem=budRemainder(cat.hasFte);
 
-    // Build headers (single row, wrap text)
-    const headCells=[T[lang].sub,T[lang].inst,T[lang].desc];
-    yr.forEach(y=>{
-      if(cat.hasFte){
-        headCells.push(`${T[lang].yr(y)}\n${T[lang].fte}`);
-        headCells.push(`${T[lang].yr(y)}\n${T[lang].budget}`);
-      } else {
-        headCells.push(`${T[lang].yr(y)}\n${T[lang].budget}`);
-      }
-    });
-    headCells.push(T[lang].total);
+    // ── Build header ──
+    // hasFte: two-row header (year group spans FTE+Budget cols).
+    // non-FTE: single-row header ONLY — never use rowSpan on a single-row head because
+    // jsPDF-autotable will treat the first body row as a header continuation, hiding it.
+    let headArr;
+    if(cat.hasFte){
+      const hr1=[
+        {content:T[lang].sub,  rowSpan:2,styles:{valign:'middle',halign:'left',fontStyle:'bold'}},
+        {content:T[lang].inst, rowSpan:2,styles:{valign:'middle',halign:'center',fontStyle:'bold'}},
+        {content:T[lang].desc, rowSpan:2,styles:{valign:'middle',halign:'left',fontStyle:'bold'}},
+      ];
+      yr.forEach(y=>{
+        hr1.push({content:T[lang].yr(y),colSpan:2,styles:{halign:'center',fillColor:[195,215,245],fontStyle:'bold'}});
+      });
+      hr1.push({content:T[lang].total,rowSpan:2,styles:{halign:'right',valign:'middle',fontStyle:'bold'}});
+      const hr2=[];
+      yr.forEach(()=>{
+        hr2.push({content:T[lang].fte,styles:{halign:'right'}});
+        hr2.push({content:T[lang].budget+' ('+curSym+')',styles:{halign:'right'}});
+      });
+      headArr=[hr1,hr2];
+    } else {
+      // Single flat header row — no rowSpan, no colSpan issues
+      const sr=[
+        {content:T[lang].sub,  styles:{halign:'left',fontStyle:'bold'}},
+        {content:T[lang].inst, styles:{halign:'center',fontStyle:'bold'}},
+        {content:T[lang].desc, styles:{halign:'left',fontStyle:'bold'}},
+      ];
+      yr.forEach(y=>{
+        sr.push({content:T[lang].yr(y)+'\n'+T[lang].budget+' ('+curSym+')',styles:{halign:'right',fillColor:[195,215,245],fontStyle:'bold'}});
+      });
+      sr.push({content:T[lang].total,styles:{halign:'right',fontStyle:'bold'}});
+      headArr=[sr];
+    }
 
-    // Body rows
+    // ── Body rows ──
     const bodyArr=[];
     visRows.forEach(row=>{
-      const cells=[rowLabel(row),row.inst,row.desc||''];
+      const cells=[
+        {content:rowLabel(row),styles:{halign:'left'}},
+        {content:row.inst,styles:{halign:'center',fontSize:7}},
+        {content:row.desc||'',styles:{halign:'left',fontSize:7,fontStyle:'italic',textColor:GREY2}},
+      ];
       yr.forEach(y=>{
         if(cat.hasFte){
           const f=row.fte[y]||0;
-          cells.push(f>0?f.toLocaleString('da-DK',{minimumFractionDigits:1,maximumFractionDigits:2}):'-');
+          cells.push({content:f>0?f.toLocaleString('da-DK',{minimumFractionDigits:1,maximumFractionDigits:1}):'-',styles:{halign:'right'}});
         }
         const b=rowBudget(row,y);
-        cells.push(b>0?fmtDKKraw(b):'-');
+        cells.push({content:b>0?pdfFmt(b):'-',styles:{halign:'right'}});
       });
       let rowT=0;yr.forEach(y=>{rowT+=rowBudget(row,y);});
-      cells.push(rowT>0?fmtDKKraw(rowT):'-');
+      cells.push({content:rowT>0?pdfFmt(rowT):'-',styles:{halign:'right',fontStyle:'bold'}});
       bodyArr.push(cells);
     });
 
-    // Subtotal
-    const subCells=[{content:`${T[lang].subtotal} — ${catLabel(cat)}`,colSpan:3,styles:{fontStyle:'bold',fillColor:BLUE_TOT,textColor:DARK}}];
+    // ── Subtotal row ──
+    let catT=0;visRows.forEach(row=>{yr.forEach(y=>{catT+=rowBudget(row,y);});});
+    const subCells=[
+      {content:`${T[lang].subtotal} — ${catLabel(cat)}`,colSpan:3,
+       styles:{fontStyle:'bold',fillColor:BLUE_TOT,textColor:DARK,halign:'left'}}
+    ];
     yr.forEach(y=>{
       if(cat.hasFte) subCells.push({content:'',styles:{fillColor:BLUE_TOT}});
       let yt=0;visRows.forEach(row=>{yt+=rowBudget(row,y);});
-      subCells.push({content:fmtDKKraw(yt),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',textColor:DARK}});
+      subCells.push({content:pdfFmt(yt),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',textColor:DARK}});
     });
-    let catT=0;visRows.forEach(row=>{yr.forEach(y=>{catT+=rowBudget(row,y);});});
-    subCells.push({content:fmtDKKraw(catT),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',textColor:DARK}});
+    subCells.push({content:pdfFmt(catT),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',textColor:DARK}});
     bodyArr.push(subCells);
 
+    // ── Overhead row (only if overheadPct > 0) ──
     if(overheadPct>0){
-      const ohCells=[{content:`${T[lang].overheadRow} (${overheadPct}%)`,colSpan:3,styles:{fontSize:7,textColor:BLUE_H,fillColor:BLUE_LP}}];
+      const catOh=Math.round(catT*overheadPct/100);
+      const ohCells=[
+        {content:`${T[lang].overheadRow} (${overheadPct}%)`,colSpan:3,
+         styles:{fontSize:7.5,textColor:BLUE_H,fillColor:BLUE_LP,halign:'left'}}
+      ];
       yr.forEach(y=>{
         if(cat.hasFte) ohCells.push({content:'',styles:{fillColor:BLUE_LP}});
         let yt=0;visRows.forEach(row=>{yt+=rowBudget(row,y);});
-        ohCells.push({content:fmtDKKraw(Math.round(yt*overheadPct/100)),styles:{fontSize:7,halign:'right',textColor:BLUE_H,fillColor:BLUE_LP}});
+        ohCells.push({content:pdfFmt(Math.round(yt*overheadPct/100)),
+          styles:{fontSize:7.5,halign:'right',textColor:BLUE_H,fillColor:BLUE_LP}});
       });
-      const catOh=Math.round(catT*overheadPct/100);
-      ohCells.push({content:fmtDKKraw(catOh),styles:{fontSize:7,halign:'right',textColor:BLUE_H,fillColor:BLUE_LP}});
+      ohCells.push({content:pdfFmt(catOh),
+        styles:{fontSize:7.5,halign:'right',textColor:BLUE_H,fillColor:BLUE_LP}});
       bodyArr.push(ohCells);
     }
 
-    // Col styles
+    // ── Column styles (sum exactly to TBL_W) ──
     const cs={};let ci=0;
-    cs[ci++]={cellWidth:SUB,halign:'left'};
-    cs[ci++]={cellWidth:INST_C,halign:'center',fontSize:7};
-    cs[ci++]={cellWidth:DESC,halign:'left',fontSize:7,fontStyle:'italic',textColor:GREY2};
-    yr.forEach(()=>{
-      if(cat.hasFte){cs[ci++]={cellWidth:FTE_W,halign:'right'};}
-      cs[ci++]={cellWidth:BUD_W,halign:'right'};
+    cs[ci++]={cellWidth:SUB,    halign:'left'};
+    cs[ci++]={cellWidth:INST_C, halign:'center',fontSize:7};
+    cs[ci++]={cellWidth:DESC_W, halign:'left',  fontSize:7,fontStyle:'italic',textColor:GREY2};
+    yr.forEach((y,yi)=>{
+      const isLast=yi===yr.length-1;
+      if(cat.hasFte) cs[ci++]={cellWidth:FTE_W_FTE,halign:'right'};
+      cs[ci++]={cellWidth:isLast?bw+brem:bw,halign:'right'};
     });
     cs[ci++]={cellWidth:TOT,halign:'right',fontStyle:'bold'};
 
     doc.autoTable({
-      head:[headCells],body:bodyArr,
+      head:headArr,body:bodyArr,
       startY:yPos,margin:{left:MARGIN,right:MARGIN},tableWidth:TBL_W,
-      styles:{fontSize:8,cellPadding:[1.5,2],lineColor:[226,224,216],lineWidth:0.2,textColor:DARK,overflow:'linebreak'},
-      headStyles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',fontSize:7.5,minCellHeight:10,halign:'center',valign:'middle'},
+      styles:{fontSize:8,cellPadding:[1.5,2.5],lineColor:[220,218,210],lineWidth:0.2,textColor:DARK,overflow:'linebreak'},
+      headStyles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',fontSize:7.5,minCellHeight:9,valign:'middle'},
       columnStyles:cs,
       didParseCell(d){
-        if(d.section==='body'&&typeof d.row.raw[0]==='string'&&d.row.index%2===1){
-          d.cell.styles.fillColor=[250,250,248];
+        if(d.section==='body'){
+          const nSpecial=overheadPct>0?2:1; // subtotal + optional overhead
+          if(d.row.index < bodyArr.length - nSpecial && d.row.index%2===1){
+            d.cell.styles.fillColor=[250,250,248];
+          }
         }
       },
     });
@@ -1165,68 +1243,81 @@ window.exportPDF=function(){
 
   // ── Grand total summary table ──
   if(yPos>190){doc.addPage();yPos=12;}
-  yPos+=3;
+  yPos+=4;
 
+  // Header: category name col + one col per year + total col
   const gtHead=[[
-    {content:'',styles:{fillColor:[240,239,233],fontStyle:'bold',fontSize:8.5}},
-    ...yr.map(y=>({content:T[lang].yr(y),styles:{fillColor:BLUE_TOT,fontStyle:'bold',halign:'center',textColor:BLUE_H,fontSize:8.5}})),
-    {content:T[lang].total,styles:{fillColor:BLUE_TOT,fontStyle:'bold',halign:'right',textColor:DARK,fontSize:8.5}},
+    {content:isDa?'Kategori':'Category',styles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',halign:'left'}},
+    ...yr.map(y=>({content:T[lang].yr(y),styles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',halign:'right'}})),
+    {content:T[lang].total,styles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',halign:'right'}},
   ]];
-  const gtBody=[];
 
+  const gtBody=[];
   categories.forEach(cat=>{
     const visRows=cat.rows.filter(row=>{
       if(instFilter!=='all'&&row.inst!==instFilter)return false;
       return yr.some(y=>rowBudget(row,y)>0);
     });
     if(!visRows.length)return;
-    const row=[catLabel(cat)];
+    const row=[{content:catLabel(cat),styles:{halign:'left'}}];
     let catT=0;
     yr.forEach(y=>{
       let yt=0;visRows.forEach(r=>{yt+=rowBudget(r,y);});
-      row.push({content:fmtDKKraw(yt),styles:{halign:'right'}});catT+=yt;
+      row.push({content:pdfFmt(yt),styles:{halign:'right'}});catT+=yt;
     });
-    row.push({content:fmtDKKraw(catT),styles:{halign:'right',fontStyle:'bold'}});
+    row.push({content:pdfFmt(catT),styles:{halign:'right',fontStyle:'bold'}});
     gtBody.push(row);
   });
 
   // Grand total row
-  const totRow=[{content:isDa?'SAMLET TOTAL (ALLE ÅR)':'GRAND TOTAL (ALL YEARS)',styles:{fontStyle:'bold',fontSize:9.5,fillColor:BLUE_TOT,textColor:DARK}}];
+  const totRow=[{content:isDa?'SAMLET TOTAL (ALLE ÅR)':'GRAND TOTAL (ALL YEARS)',
+    styles:{fontStyle:'bold',fontSize:9,fillColor:BLUE_TOT,textColor:DARK,halign:'left'}}];
   yr.forEach(y=>{
-    totRow.push({content:fmtDKKraw(yearGrand(y)),styles:{halign:'right',fontStyle:'bold',fontSize:9,fillColor:BLUE_TOT,textColor:DARK}});
+    totRow.push({content:pdfFmt(yearGrand(y)),
+      styles:{halign:'right',fontStyle:'bold',fontSize:9,fillColor:BLUE_TOT,textColor:DARK}});
   });
-  totRow.push({content:fmtDKKraw(gt),styles:{halign:'right',fontStyle:'bold',fontSize:10,fillColor:BLUE_TOT,textColor:DARK}});
+  totRow.push({content:pdfFmt(gt),
+    styles:{halign:'right',fontStyle:'bold',fontSize:10,fillColor:BLUE_TOT,textColor:DARK}});
   gtBody.push(totRow);
 
+  // Overhead total (only if > 0)
   if(overheadPct>0){
-    const ohTotRow=[{content:`${T[lang].inclOverhead} (${overheadPct}%)`,styles:{fontStyle:'bold',fontSize:8.5,textColor:BLUE_H,fillColor:BLUE_LP}}];
+    const ohTotRow=[{content:`${T[lang].inclOverhead} (${overheadPct}%)`,
+      styles:{fontStyle:'bold',fontSize:8.5,textColor:BLUE_H,fillColor:BLUE_LP,halign:'left'}}];
     yr.forEach(y=>{
-      ohTotRow.push({content:fmtDKKraw(Math.round(yearGrand(y)*(1+overheadPct/100))),styles:{halign:'right',fontStyle:'bold',fillColor:BLUE_LP,textColor:BLUE_H}});
+      const yt=yearGrand(y);
+      ohTotRow.push({content:pdfFmt(Math.round(yt*(1+overheadPct/100))),
+        styles:{halign:'right',fontStyle:'bold',fillColor:BLUE_LP,textColor:BLUE_H}});
     });
-    ohTotRow.push({content:fmtDKKraw(gt+oh),styles:{halign:'right',fontStyle:'bold',fontSize:9,fillColor:BLUE_LP,textColor:BLUE_H}});
+    ohTotRow.push({content:pdfFmt(gt+oh),
+      styles:{halign:'right',fontStyle:'bold',fontSize:9,fillColor:BLUE_LP,textColor:BLUE_H}});
     gtBody.push(ohTotRow);
   }
 
-  const gtColW=Math.floor((TBL_W-55)/(yr.length+1));
-  const gtCS={0:{cellWidth:TBL_W-gtColW*(yr.length+1),halign:'left',fontStyle:'bold'}};
-  yr.forEach((_,i)=>{gtCS[i+1]={cellWidth:gtColW,halign:'right'};});
-  gtCS[yr.length+1]={cellWidth:gtColW,halign:'right',fontStyle:'bold'};
+  // Column widths: label gets 40% of TBL_W, rest split equally among yr+total cols
+  const gtValW=Math.floor(TBL_W*0.60/(yr.length+1));
+  const gtLblW=TBL_W-gtValW*(yr.length+1);
+  const gtCS={0:{cellWidth:gtLblW,halign:'left',fontStyle:'bold'}};
+  yr.forEach((_,i)=>{gtCS[i+1]={cellWidth:gtValW,halign:'right'};});
+  gtCS[yr.length+1]={cellWidth:gtValW,halign:'right',fontStyle:'bold'};
 
   doc.autoTable({
-    head:gtHead,body:gtBody,startY:yPos,margin:{left:MARGIN,right:MARGIN},tableWidth:TBL_W,
+    head:gtHead,body:gtBody,
+    startY:yPos,margin:{left:MARGIN,right:MARGIN},tableWidth:TBL_W,
     styles:{fontSize:8,cellPadding:[2,3],lineColor:[192,57,43],lineWidth:0.3,textColor:DARK},
-    headStyles:{fillColor:[240,239,233],fontSize:8,fontStyle:'bold',textColor:GREY2},
+    headStyles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',fontSize:8.5,halign:'right'},
     columnStyles:gtCS,
     didParseCell(d){
       if(d.section==='body'){
-        const isTotal=d.row.index===gtBody.length-1-(overheadPct>0?1:0);
-        const isOh=overheadPct>0&&d.row.index===gtBody.length-1;
-        if(!isTotal&&!isOh&&d.row.index%2===1) d.cell.styles.fillColor=[250,250,248];
+        const nSpec=overheadPct>0?2:1;
+        if(d.row.index<gtBody.length-nSpec && d.row.index%2===1){
+          d.cell.styles.fillColor=[250,250,248];
+        }
       }
     }
   });
 
-  // Page numbers
+  // ── Page numbers (no confidential footer) ──
   const pc=doc.internal.getNumberOfPages();
   for(let i=1;i<=pc;i++){
     doc.setPage(i);
@@ -1234,8 +1325,8 @@ window.exportPDF=function(){
     doc.text(`${isDa?'Side':'Page'} ${i} / ${pc}`,PAGE_W-MARGIN,207,{align:'right'});
   }
 
-  const fname=projTitle?`Budget_${projTitle.replace(/[^a-zA-Z0-9æøåÆØÅ]/g,'_')}.pdf`:(isDa?'Forskningsbudget.pdf':'Research_Budget.pdf');
-  doc.save(fname);
+  const safeName=(projTitle||'budget').replace(/[^a-zA-Z0-9æøåÆØÅ]/g,'_');
+  doc.save(isDa?`Forskningsbudget_${safeName}.pdf`:`Research_Budget_${safeName}.pdf`);
 };
 
 // ════════════════════════════════════════════════════
