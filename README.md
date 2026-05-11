@@ -1,4 +1,3 @@
-# Budget Udregner 
 <html lang="da">
 <head>
 <meta charset="UTF-8"/>
