@@ -931,38 +931,94 @@ function applyInstFilter(){
 }
 
 // ════════════════════════════════════════════════════
-//  SHARE LINK (encode state in URL hash)
+//  STATE SERIALIZATION — compact, minimal JSON
 // ════════════════════════════════════════════════════
-function serializeState(){
-  const s={
-    lang,currency,eurRate,numYears,instFilter,overheadPct,inflationPct,
-    projTitle:document.getElementById('proj-title').value,
-    rates,
-    categories:categories.map(cat=>({
-      id:cat.id,labelKey:cat.labelKey,label:cat.label,color:cat.color,hasFte:cat.hasFte,desc:cat.desc,
-      rows:cat.rows.map(row=>({
-        id:row.id,labelKey:row.labelKey,label:row.label,inst:row.inst,rateKey:row.rateKey,
-        fte:row.fte,budget:row.budget,budgetManual:row.budgetManual,desc:row.desc
-      }))
+
+// Build a compact state object — strip defaults and empty values to minimise size
+function buildState(){
+  const defaultRates={};
+  RATE_DEFS.forEach(r=>{defaultRates[r.key]=r.default;});
+
+  // Only store rates that differ from defaults
+  const changedRates={};
+  Object.keys(rates).forEach(k=>{
+    if(rates[k]!==defaultRates[k]) changedRates[k]=rates[k];
+  });
+
+  return {
+    v:2, // version
+    l:lang==='en'?'en':undefined,
+    c:currency==='EUR'?'EUR':undefined,
+    e:eurRate!==7.4728?eurRate:undefined,
+    n:numYears>1?numYears:undefined,
+    f:instFilter!=='all'?instFilter:undefined,
+    o:overheadPct||undefined,
+    i:inflationPct!==2?inflationPct:undefined,
+    p:document.getElementById('proj-title').value||undefined,
+    r:Object.keys(changedRates).length?changedRates:undefined,
+    cats:categories.map(cat=>({
+      id:cat.id,
+      lk:cat.labelKey||undefined,
+      lb:cat.label,
+      co:cat.color,
+      ft:cat.hasFte?1:undefined,
+      ds:cat.desc||undefined,
+      rw:cat.rows
+        .filter(row=>Object.keys(row.budget).some(y=>row.budget[y]>0)||Object.keys(row.fte).some(y=>row.fte[y]>0)||row.desc)
+        .map(row=>({
+          id:row.id,
+          lk:row.labelKey||undefined,
+          lb:row.label,
+          in:row.inst!=='Rigshospitalet'?row.inst:undefined,
+          rk:row.rateKey||undefined,
+          ft:Object.keys(row.fte).length?row.fte:undefined,
+          bu:Object.keys(row.budget).filter(y=>row.budget[y]>0).length?
+             Object.fromEntries(Object.entries(row.budget).filter(([,v])=>v>0)):undefined,
+          bm:Object.keys(row.budgetManual).filter(y=>row.budgetManual[y]).length?
+             Object.fromEntries(Object.entries(row.budgetManual).filter(([,v])=>v)):undefined,
+          ds:row.desc||undefined,
+        }))
     }))
   };
-  return btoa(encodeURIComponent(JSON.stringify(s)));
 }
 
-function deserializeState(b64){
+// Expand compact state back to full state
+function expandState(s){
+  if(!s||!s.cats) return false;
   try{
-    const s=JSON.parse(decodeURIComponent(atob(b64)));
-    lang=s.lang||'da'; currency=s.currency||'DKK';
-    eurRate=s.eurRate||7.4728; numYears=s.numYears||1;
-    instFilter=s.instFilter||'all'; overheadPct=s.overheadPct||0;
-    inflationPct=s.inflationPct!==undefined?s.inflationPct:2;
-    if(s.rates) Object.assign(rates,s.rates);
-    if(s.categories) categories=s.categories;
-    if(s.projTitle){
-      document.getElementById('proj-title').value=s.projTitle;
-      onProjTitle(s.projTitle);
+    lang      = s.l||'da';
+    currency  = s.c||'DKK';
+    eurRate   = s.e||7.4728;
+    numYears  = s.n||1;
+    instFilter= s.f||'all';
+    overheadPct = s.o||0;
+    inflationPct= s.i!==undefined?s.i:2;
+    if(s.r) Object.assign(rates,s.r);
+    if(s.p){
+      document.getElementById('proj-title').value=s.p;
+      onProjTitle(s.p);
     }
-    // Sync UI inputs
+    categories=s.cats.map(cat=>({
+      id:cat.id,
+      labelKey:cat.lk||'',
+      label:cat.lb,
+      color:cat.co,
+      hasFte:!!cat.ft,
+      desc:cat.ds||'',
+      rows:(cat.rw||[]).map(row=>({
+        id:row.id,
+        labelKey:row.lk||'',
+        label:row.lb,
+        inst:row.in||'Rigshospitalet',
+        rateKey:row.rk||'',
+        fte:row.ft||{},
+        budget:row.bu||{},
+        budgetManual:row.bm||{},
+        desc:row.ds||'',
+      }))
+    }));
+    // Re-add rows that were stripped (empty rows) as blank rows to preserve structure
+    // Sync UI
     document.getElementById('rate-inp').value=eurRate;
     document.getElementById('overhead-inp').value=overheadPct;
     document.getElementById('inflation-inp').value=inflationPct;
@@ -973,28 +1029,106 @@ function deserializeState(b64){
     document.getElementById('btn-da').classList.toggle('active',lang==='da');
     document.getElementById('btn-en').classList.toggle('active',lang==='en');
     return true;
-  } catch(e){return false;}
+  } catch(e){console.error('expandState error:',e);return false;}
 }
 
-window.shareLink=function(){
-  const state=serializeState();
-  const url=window.location.href.split('#')[0]+'#state='+state;
-  window.history.replaceState(null,'',url);
+// ════════════════════════════════════════════════════
+//  SHARE LINK — two strategies:
+//  1. window.storage (Claude artifact env): save JSON, link = #s=KEY (8 chars)
+//  2. Fallback (GitHub Pages etc.): compress JSON into URL-safe base62, link = #d=...
+// ════════════════════════════════════════════════════
 
-  // Show share bar
+// Base62 helpers for minimal URL encoding
+const B62='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+function b62enc(str){
+  // Encode UTF-8 bytes as base62 — ~25% shorter than base64
+  const bytes=new TextEncoder().encode(str);
+  let n=BigInt(0);
+  for(const b of bytes){ n=(n<<8n)|BigInt(b); }
+  if(n===0n) return '0';
+  let out='';
+  while(n>0n){ out=B62[Number(n%62n)]+out; n/=62n; }
+  return out;
+}
+function b62dec(s){
+  let n=BigInt(0);
+  for(const c of s){ n=n*62n+BigInt(B62.indexOf(c)); }
+  const bytes=[];
+  while(n>0n){ bytes.unshift(Number(n&255n)); n>>=8n; }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+async function saveToStorage(key,data){
+  try{
+    if(typeof window.storage==='undefined') return false;
+    const res=await window.storage.set('budget:'+key,JSON.stringify(data));
+    return !!res;
+  } catch(e){ return false; }
+}
+async function loadFromStorage(key){
+  try{
+    if(typeof window.storage==='undefined') return null;
+    const res=await window.storage.get('budget:'+key);
+    return res?JSON.parse(res.value):null;
+  } catch(e){ return null; }
+}
+
+function shortId(){
+  // 8 random base62 chars — 62^8 ≈ 218 trillion combinations
+  let id='';
+  for(let i=0;i<8;i++) id+=B62[Math.floor(Math.random()*62)];
+  return id;
+}
+
+function showShareBar(shortUrl,fullUrl){
   const wrap=document.getElementById('share-bar-wrap');
   wrap.innerHTML=`<div class="share-bar">
     <i class="ti ti-link" style="color:var(--blue)"></i>
-    <span style="font-weight:500;color:var(--blue);font-size:12px">Del-link:</span>
-    <input type="text" value="${url}" readonly onclick="this.select()" id="share-url"/>
+    <span style="font-weight:600;color:var(--blue);font-size:12px;white-space:nowrap">Del-link:</span>
+    <input type="text" value="${shortUrl}" readonly onclick="this.select()" id="share-url" style="min-width:0;flex:1"/>
     <button class="icon-btn" onclick="copyShareLink()"><i class="ti ti-copy"></i> ${T[lang].copyLink}</button>
+    ${fullUrl&&fullUrl!==shortUrl?`<span style="font-size:10px;color:var(--text3)">Kopiér hvis link ikke virker</span>`:''}
   </div>`;
+}
+
+window.shareLink=async function(){
+  const state=buildState();
+  const base=window.location.href.split('#')[0];
+
+  // Try storage-based short link first
+  const key=shortId();
+  const saved=await saveToStorage(key,state);
+
+  if(saved){
+    const shortUrl=base+'#s='+key;
+    window.history.replaceState(null,'',shortUrl);
+    showShareBar(shortUrl,null);
+    showToast('Kort link genereret ✓');
+    return;
+  }
+
+  // Fallback: compact JSON → base62 → URL
+  const json=JSON.stringify(state);
+  const compressed=b62enc(json);
+  const fallbackUrl=base+'#d='+compressed;
+  window.history.replaceState(null,'',fallbackUrl);
+  showShareBar(fallbackUrl,fallbackUrl);
+
+  if(fallbackUrl.length>2000){
+    showToast(lang==='da'?'Link er langt — brug del-knap til at kopiere':'Link is long — use copy button');
+  } else {
+    showToast(lang==='da'?'Link klar til deling':'Link ready to share');
+  }
 };
 
 window.copyShareLink=function(){
   const inp=document.getElementById('share-url');
+  if(!inp) return;
   inp.select();
   navigator.clipboard.writeText(inp.value).then(()=>{
+    showToast(T[lang].linkCopied);
+  }).catch(()=>{
+    document.execCommand('copy');
     showToast(T[lang].linkCopied);
   });
 };
@@ -1006,16 +1140,82 @@ function showToast(msg){
 }
 
 // Load shared state from URL hash
-function loadFromHash(){
+// Handles three formats:
+//   #s=KEY      — short key stored in window.storage (Claude artifact env)
+//   #d=BASE62   — compact base62-encoded JSON (GitHub Pages fallback)
+//   #state=B64  — legacy long base64 format (backwards compat)
+async function loadFromHash(){
   const hash=window.location.hash;
-  if(hash.startsWith('#state=')){
-    const b64=hash.slice(7);
-    if(deserializeState(b64)){
+
+  // Format 1: storage-based short key
+  if(hash.startsWith('#s=')){
+    const key=hash.slice(3);
+    const state=await loadFromStorage(key);
+    if(state&&expandState(state)){
       buildRatesPanel();renderAll();
       return true;
     }
+    // Key not found in storage — show helpful error
+    showStorageError(key);
+    return false;
   }
+
+  // Format 2: base62-compressed JSON
+  if(hash.startsWith('#d=')){
+    try{
+      const compressed=hash.slice(3);
+      const json=b62dec(compressed);
+      const state=JSON.parse(json);
+      if(expandState(state)){
+        buildRatesPanel();renderAll();
+        return true;
+      }
+    } catch(e){ console.warn('b62 decode failed',e); }
+    return false;
+  }
+
+  // Format 3: legacy base64 (old links still work)
+  if(hash.startsWith('#state=')){
+    try{
+      const b64=hash.slice(7);
+      const s=JSON.parse(decodeURIComponent(atob(b64)));
+      // Map old format to new category structure
+      if(s.categories) categories=s.categories;
+      lang=s.lang||'da'; currency=s.currency||'DKK';
+      eurRate=s.eurRate||7.4728; numYears=s.numYears||1;
+      instFilter=s.instFilter||'all'; overheadPct=s.overheadPct||0;
+      inflationPct=s.inflationPct!==undefined?s.inflationPct:2;
+      if(s.rates) Object.assign(rates,s.rates);
+      if(s.projTitle){
+        document.getElementById('proj-title').value=s.projTitle;
+        onProjTitle(s.projTitle);
+      }
+      document.getElementById('rate-inp').value=eurRate;
+      document.getElementById('overhead-inp').value=overheadPct;
+      document.getElementById('inflation-inp').value=inflationPct;
+      document.querySelectorAll('#year-btns .pill').forEach(p=>p.classList.toggle('active',+p.dataset.y===numYears));
+      document.querySelectorAll('#inst-btns .pill').forEach(p=>p.classList.toggle('active',p.dataset.inst===instFilter));
+      document.getElementById('btn-dkk').classList.toggle('active',currency==='DKK');
+      document.getElementById('btn-eur').classList.toggle('active',currency==='EUR');
+      document.getElementById('btn-da').classList.toggle('active',lang==='da');
+      document.getElementById('btn-en').classList.toggle('active',lang==='en');
+      buildRatesPanel();renderAll();
+      return true;
+    } catch(e){ console.warn('legacy decode failed',e); }
+    return false;
+  }
+
   return false;
+}
+
+function showStorageError(key){
+  const wrap=document.getElementById('share-bar-wrap');
+  wrap.innerHTML=`<div class="share-bar" style="background:#FEF2F2;border-color:#FCA5A5">
+    <i class="ti ti-alert-triangle" style="color:#DC2626"></i>
+    <span style="color:#DC2626;font-size:12px;font-weight:500">
+      ${lang==='da'?'Budget ikke fundet (nøgle: '+key+'). Linket er muligvis udløbet eller genereret i en anden session.':'Budget not found (key: '+key+'). The link may have expired or was created in a different session.'}
+    </span>
+  </div>`;
 }
 
 // ════════════════════════════════════════════════════
@@ -1478,9 +1678,13 @@ document.getElementById('inst-btns').addEventListener('click',e=>{
 // ════════════════════════════════════════════════════
 //  INIT
 // ════════════════════════════════════════════════════
-if(!loadFromHash()){
-  buildRatesPanel();renderAll();
-}
+// Init — async because loadFromHash may fetch from storage
+(async()=>{
+  const loaded=await loadFromHash();
+  if(!loaded){
+    buildRatesPanel();renderAll();
+  }
+})();
 </script>
 
 </body>
